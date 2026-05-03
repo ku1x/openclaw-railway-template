@@ -121,6 +121,7 @@ const OPENCLAW_ENTRY =
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
+const ENABLE_WEB_CLI = process.env.ENABLE_WEB_CLI?.toLowerCase() !== "false";
 const TUI_IDLE_TIMEOUT_MS = Number.parseInt(
   process.env.TUI_IDLE_TIMEOUT_MS ?? "300000",
   10,
@@ -129,6 +130,9 @@ const TUI_MAX_SESSION_MS = Number.parseInt(
   process.env.TUI_MAX_SESSION_MS ?? "1800000",
   10,
 );
+const ENABLE_NOVNC_PROXY = process.env.ENABLE_NOVNC?.toLowerCase() === "true";
+const NOVNC_INTERNAL_PORT = Number.parseInt(process.env.NOVNC_PORT ?? "6080", 10);
+const NOVNC_TARGET = `http://127.0.0.1:${NOVNC_INTERNAL_PORT}`;
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -811,6 +815,8 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     openclawVersion: version,
     authGroups,
     tuiEnabled: ENABLE_WEB_TUI,
+    cliEnabled: ENABLE_WEB_CLI,
+    novncEnabled: ENABLE_NOVNC_PROXY,
   });
 });
 
@@ -1546,7 +1552,32 @@ app.get("/tui", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "tui.html"));
 });
 
+app.get("/cli", requireSetupAuth, (_req, res) => {
+  if (!ENABLE_WEB_CLI) {
+    return res
+      .status(403)
+      .type("text/plain")
+      .send("Web CLI is disabled. Set ENABLE_WEB_CLI=true to enable it.");
+  }
+  if (!isConfigured()) {
+    return res.redirect("/setup");
+  }
+  res.sendFile(path.join(process.cwd(), "src", "public", "cli.html"));
+});
+
+app.use("/novnc", requireSetupAuth, (req, res) => {
+  if (!ENABLE_NOVNC_PROXY) {
+    return res
+      .status(403)
+      .type("text/plain")
+      .send("noVNC is disabled. Set ENABLE_NOVNC=true to enable it.");
+  }
+  req.url = req.url.replace(/^\/novnc/, "") || "/";
+  return novncProxy.web(req, res, { target: NOVNC_TARGET });
+});
+
 let activeTuiSession = null;
+let activeCliSession = null;
 
 function verifyTuiAuth(req) {
   if (!SETUP_PASSWORD) return false;
@@ -1675,8 +1706,131 @@ function createTuiWebSocketServer(httpServer) {
   return wss;
 }
 
+function createCliWebSocketServer(httpServer) {
+  const wss = new WebSocketServer({ noServer: true });
+
+  wss.on("connection", (ws, req) => {
+    const clientIp = req.socket?.remoteAddress || "unknown";
+    log.info("cli", `session started from ${clientIp}`);
+
+    let ptyProcess = null;
+    let idleTimer = null;
+    let maxSessionTimer = null;
+
+    activeCliSession = {
+      ws,
+      pty: null,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    };
+
+    function resetIdleTimer() {
+      if (activeCliSession) {
+        activeCliSession.lastActivity = Date.now();
+      }
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        log.info("cli", "session idle timeout");
+        ws.close(4002, "Idle timeout");
+      }, TUI_IDLE_TIMEOUT_MS);
+    }
+
+    function spawnPty(cols, rows) {
+      if (ptyProcess) return;
+
+      log.info("cli", `spawning PTY with ${cols}x${rows}`);
+      const shell = process.env.SHELL || "/bin/bash";
+      ptyProcess = pty.spawn(shell, ["-l"], {
+        name: "xterm-256color",
+        cols,
+        rows,
+        cwd: WORKSPACE_DIR,
+        env: {
+          ...process.env,
+          OPENCLAW_STATE_DIR: STATE_DIR,
+          OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+          TERM: "xterm-256color",
+        },
+      });
+
+      if (activeCliSession) {
+        activeCliSession.pty = ptyProcess;
+      }
+
+      idleTimer = setTimeout(() => {
+        log.info("cli", "session idle timeout");
+        ws.close(4002, "Idle timeout");
+      }, TUI_IDLE_TIMEOUT_MS);
+
+      maxSessionTimer = setTimeout(() => {
+        log.info("cli", "max session duration reached");
+        ws.close(4002, "Max session duration");
+      }, TUI_MAX_SESSION_MS);
+
+      ptyProcess.onData((data) => {
+        if (ws.readyState === ws.OPEN) {
+          ws.send(data);
+        }
+      });
+
+      ptyProcess.onExit(({ exitCode, signal }) => {
+        log.info("cli", `PTY exited code=${exitCode} signal=${signal}`);
+        if (ws.readyState === ws.OPEN) {
+          ws.close(1000, "Process exited");
+        }
+      });
+    }
+
+    ws.on("message", (message) => {
+      resetIdleTimer();
+      try {
+        const msg = JSON.parse(message.toString());
+        if (msg.type === "resize" && msg.cols && msg.rows) {
+          const cols = Math.min(Math.max(msg.cols, 10), 500);
+          const rows = Math.min(Math.max(msg.rows, 5), 200);
+          if (!ptyProcess) {
+            spawnPty(cols, rows);
+          } else {
+            ptyProcess.resize(cols, rows);
+          }
+        } else if (msg.type === "input" && msg.data && ptyProcess) {
+          ptyProcess.write(msg.data);
+        }
+      } catch (err) {
+        log.warn("cli", `invalid message: ${err.message}`);
+      }
+    });
+
+    ws.on("close", () => {
+      log.info("cli", "session closed");
+      clearTimeout(idleTimer);
+      clearTimeout(maxSessionTimer);
+      if (ptyProcess) {
+        try {
+          ptyProcess.kill();
+        } catch {}
+      }
+      activeCliSession = null;
+    });
+
+    ws.on("error", (err) => {
+      log.error("cli", `WebSocket error: ${err.message}`);
+    });
+  });
+
+  return wss;
+}
+
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
+  ws: true,
+  xfwd: true,
+  changeOrigin: true,
+  proxyTimeout: 120_000,
+  timeout: 120_000,
+});
+const novncProxy = httpProxy.createProxyServer({
+  target: NOVNC_TARGET,
   ws: true,
   xfwd: true,
   changeOrigin: true,
@@ -1714,6 +1868,13 @@ proxy.on("proxyReq", (proxyReq, req, res) => {
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
+});
+novncProxy.on("error", (err, _req, res) => {
+  log.error("novnc-proxy", String(err));
+  if (res && typeof res.headersSent !== "undefined" && !res.headersSent) {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("noVNC backend unavailable");
+  }
 });
 
 app.use(async (req, res) => {
@@ -1761,6 +1922,8 @@ const server = app.listen(PORT, () => {
   log.info("wrapper", `listening on port ${PORT}`);
   log.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
   log.info("wrapper", `web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
+  log.info("wrapper", `web CLI: ${ENABLE_WEB_CLI ? "enabled" : "disabled"}`);
+  log.info("wrapper", `noVNC proxy: ${ENABLE_NOVNC_PROXY ? "enabled" : "disabled"} (${NOVNC_TARGET})`);
   log.info("wrapper", `configured: ${isConfigured()}`);
   void probeDeviceBootstrapSdk();
 
@@ -1782,6 +1945,7 @@ const server = app.listen(PORT, () => {
 });
 
 const tuiWss = createTuiWebSocketServer(server);
+const cliWss = createCliWebSocketServer(server);
 
 server.on("upgrade", async (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -1808,6 +1972,47 @@ server.on("upgrade", async (req, socket, head) => {
     tuiWss.handleUpgrade(req, socket, head, (ws) => {
       tuiWss.emit("connection", ws, req);
     });
+    return;
+  }
+
+  if (url.pathname === "/cli/ws") {
+    if (!ENABLE_WEB_CLI) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    if (!verifyTuiAuth(req)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"OpenClaw CLI\"\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    if (activeCliSession) {
+      socket.write("HTTP/1.1 409 Conflict\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    cliWss.handleUpgrade(req, socket, head, (ws) => {
+      cliWss.emit("connection", ws, req);
+    });
+    return;
+  }
+
+  if (url.pathname.startsWith("/novnc/") || url.pathname === "/novnc") {
+    if (!ENABLE_NOVNC_PROXY) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (!verifyTuiAuth(req)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"OpenClaw noVNC\"\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    req.url = req.url.replace(/^\/novnc/, "") || "/";
+    novncProxy.ws(req, socket, head, { target: NOVNC_TARGET });
     return;
   }
 
@@ -1839,6 +2044,13 @@ async function gracefulShutdown(signal) {
       activeTuiSession.pty.kill();
     } catch {}
     activeTuiSession = null;
+  }
+  if (activeCliSession) {
+    try {
+      activeCliSession.ws.close(1001, "Server shutting down");
+      activeCliSession.pty.kill();
+    } catch {}
+    activeCliSession = null;
   }
 
   server.close();

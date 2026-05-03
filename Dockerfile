@@ -4,16 +4,24 @@ RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+ dbus \
+ fluxbox \
     git \
     gosu \
+ novnc \
     procps \
     python3 \
+ python3-websockify \
+ chromium \
     build-essential \
+ x11vnc \
+ xvfb \
     zip \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g openclaw@2026.5.2
 RUN npm install -g clawhub@latest
+RUN npm install -g playwright@latest
 
 WORKDIR /app
 
@@ -38,7 +46,7 @@ ENV HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew"
 
 ENV PORT=8080
 ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
-EXPOSE 8080
+EXPOSE 8080 6080 5900
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD curl -f http://localhost:8080/setup/healthz || exit 1

@@ -45,6 +45,8 @@
       showPairingModal: false,
       isReady: false,
       tuiEnabled: false,
+      cliEnabled: false,
+      novncEnabled: false,
       exporting: false,
       showExportInfo: false,
       showDevicesModal: false,
@@ -103,6 +105,8 @@
           this.configured = j.configured;
           this.openclawVersion = j.openclawVersion || '';
           this.tuiEnabled = j.tuiEnabled || false;
+          this.cliEnabled = j.cliEnabled !== false;
+          this.novncEnabled = j.novncEnabled || false;
           this.status = j.configured ? 'Configured - open /openclaw' : 'Not configured - run setup below';
           this.authGroups = j.authGroups || [];
           if (this.authGroups.length > 0) {
@@ -460,9 +464,17 @@
           Open OpenClaw UI
           <svg class="icon-link" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
         </a>
-        <a x-show="tuiEnabled" href="/tui" target="_blank" class="inline-link link-purple">
-          Open Terminal
+        <a x-show="cliEnabled" href="/cli" target="_blank" class="inline-link link-purple">
+          Open CLI
           <svg class="icon-link" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+        </a>
+        <a x-show="tuiEnabled" href="/tui" target="_blank" class="inline-link link-purple">
+          Open TUI
+          <svg class="icon-link" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+        </a>
+        <a x-show="novncEnabled" href="/novnc/vnc.html?path=/novnc/websockify" target="_blank" class="inline-link link-teal">
+          Open Browser (noVNC)
+          <svg class="icon-link" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L15 12l-5.25-5M21 12H3"/></svg>
         </a>
       </div>
     </div>
