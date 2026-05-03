@@ -25,6 +25,10 @@ const WORKSPACE_DIR =
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+/** HttpOnly cookie so WebSocket upgrades (noVNC /cli /tui) can auth without Authorization header. */
+const SETUP_SESSION_COOKIE = "openclaw_setup";
+const SETUP_SESSION_COOKIE_MAX_AGE_SEC = 7 * 24 * 60 * 60;
+
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
 const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
@@ -499,6 +503,66 @@ const setupRateLimiter = {
   },
 };
 
+function isSecureForwardedRequest(req) {
+  if (req.socket?.encrypted) return true;
+  const proto = String(req.headers["x-forwarded-proto"] ?? "")
+    .split(",")[0]
+    ?.trim();
+  return proto === "https";
+}
+
+function parseCookies(req) {
+  const raw = req.headers.cookie;
+  if (!raw) return {};
+  const out = {};
+  for (const segment of raw.split(";")) {
+    const idx = segment.indexOf("=");
+    if (idx === -1) continue;
+    const key = segment.slice(0, idx).trim();
+    let val = segment.slice(idx + 1).trim();
+    try {
+      val = decodeURIComponent(val);
+    } catch {
+      /* keep raw */
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+function setupSessionToken() {
+  if (!SETUP_PASSWORD) return null;
+  return crypto
+    .createHmac("sha256", SETUP_PASSWORD)
+    .update("openclaw-railway-setup-session-v1")
+    .digest("base64url");
+}
+
+function verifySetupSessionCookie(req) {
+  const token = setupSessionToken();
+  if (!token) return false;
+  const got = parseCookies(req)[SETUP_SESSION_COOKIE];
+  if (!got) return false;
+  const a = Buffer.from(got, "utf8");
+  const b = Buffer.from(token, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function appendSetupSessionCookie(res, req) {
+  const token = setupSessionToken();
+  if (!token) return;
+  const parts = [
+    `${SETUP_SESSION_COOKIE}=${encodeURIComponent(token)}`,
+    `Max-Age=${SETUP_SESSION_COOKIE_MAX_AGE_SEC}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+  ];
+  if (isSecureForwardedRequest(req)) parts.push("Secure");
+  res.append("Set-Cookie", parts.join("; "));
+}
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -507,6 +571,10 @@ function requireSetupAuth(req, res, next) {
       .send(
         "SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.",
       );
+  }
+
+  if (verifySetupSessionCookie(req)) {
+    return next();
   }
 
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
@@ -530,6 +598,7 @@ function requireSetupAuth(req, res, next) {
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Invalid password");
   }
+  appendSetupSessionCookie(res, req);
   return next();
 }
 
@@ -1581,6 +1650,7 @@ let activeCliSession = null;
 
 function verifyTuiAuth(req) {
   if (!SETUP_PASSWORD) return false;
+  if (verifySetupSessionCookie(req)) return true;
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
   if (scheme !== "Basic" || !encoded) return false;
