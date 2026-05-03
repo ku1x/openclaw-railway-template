@@ -1641,6 +1641,22 @@ app.use("/novnc", requireSetupAuth, (req, res) => {
       .type("text/plain")
       .send("noVNC is disabled. Set ENABLE_NOVNC=true to enable it.");
   }
+  // noVNC defaults WebSocket to /websockify (site root), which bypasses this /novnc/*
+  // proxy and hangs. Force the proxied path unless the client already set one.
+  if (req.method === "GET" && req.path === "/vnc.html" && !req.query.path) {
+    const params = new URLSearchParams();
+    for (const [key, val] of Object.entries(req.query)) {
+      if (val === undefined) continue;
+      if (Array.isArray(val)) {
+        for (const v of val) params.append(key, String(v));
+      } else {
+        params.set(key, String(val));
+      }
+    }
+    params.set("path", "/novnc/websockify");
+    if (!params.has("autoconnect")) params.set("autoconnect", "1");
+    return res.redirect(302, `/novnc/vnc.html?${params.toString()}`);
+  }
   req.url = req.url.replace(/^\/novnc/, "") || "/";
   return novncProxy.web(req, res, { target: NOVNC_TARGET });
 });
