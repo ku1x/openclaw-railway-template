@@ -29,6 +29,10 @@ const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 const SETUP_SESSION_COOKIE = "openclaw_setup";
 const SETUP_SESSION_COOKIE_MAX_AGE_SEC = 7 * 24 * 60 * 60;
 
+/** One-shot tickets: some proxies/browsers omit cookies on WS upgrade vs same-origin HTTPS. */
+const NOVNC_WS_TICKET_MS = 120_000;
+const novncWsTickets = new Map();
+
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
 const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
@@ -561,6 +565,64 @@ function appendSetupSessionCookie(res, req) {
   ];
   if (isSecureForwardedRequest(req)) parts.push("Secure");
   res.append("Set-Cookie", parts.join("; "));
+}
+
+function pruneNovncWsTickets() {
+  const now = Date.now();
+  for (const [k, exp] of novncWsTickets) {
+    if (exp < now) novncWsTickets.delete(k);
+  }
+}
+
+function mintNovncWsTicket() {
+  pruneNovncWsTickets();
+  const token = crypto.randomBytes(24).toString("base64url");
+  novncWsTickets.set(token, Date.now() + NOVNC_WS_TICKET_MS);
+  return token;
+}
+
+function stripTrailingTicketQuery(reqUrlStr) {
+  try {
+    const u = new URL(reqUrlStr, "http://noop.local");
+    u.searchParams.delete("t");
+    return u.pathname + (u.search || "");
+  } catch {
+    return reqUrlStr;
+  }
+}
+
+function consumeNovncWsTicketFromUpgradeUrl(reqUrlStr) {
+  try {
+    const u = new URL(reqUrlStr, "http://noop.local");
+    const t = u.searchParams.get("t");
+    if (!t) return false;
+    const exp = novncWsTickets.get(t);
+    if (exp === undefined || Date.now() > exp) {
+      novncWsTickets.delete(t);
+      return false;
+    }
+    novncWsTickets.delete(t);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** WebSocket upgrades to `/novnc/websockify` — cookie/basic or one-shot `?t=` from vnc redirect. */
+function verifyNovncWsUpgrade(req, rawUpgradeUrlPath) {
+  if (!SETUP_PASSWORD) return false;
+  if (consumeNovncWsTicketFromUpgradeUrl(rawUpgradeUrlPath)) return true;
+  if (verifySetupSessionCookie(req)) return true;
+
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) return false;
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  const passwordHash = crypto.createHash("sha256").update(password).digest();
+  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+  return crypto.timingSafeEqual(passwordHash, expectedHash);
 }
 
 function requireSetupAuth(req, res, next) {
@@ -1641,20 +1703,23 @@ app.use("/novnc", requireSetupAuth, (req, res) => {
       .type("text/plain")
       .send("noVNC is disabled. Set ENABLE_NOVNC=true to enable it.");
   }
-  // noVNC defaults WebSocket to /websockify (site root), which bypasses this /novnc/*
-  // proxy and hangs. Force the proxied path unless the client already set one.
-  if (req.method === "GET" && req.path === "/vnc.html" && !req.query.path) {
+  // Issue a one-shot ?t= for WebSocket URL (embedded in path=) until nwst=1,
+  // so WS works even when HttpOnly cookies are not sent on the upgrade handshake.
+  if (req.method === "GET" && req.path === "/vnc.html" && req.query.nwst !== "1") {
+    const ticket = mintNovncWsTicket();
     const params = new URLSearchParams();
     for (const [key, val] of Object.entries(req.query)) {
-      if (val === undefined) continue;
+      if (val === undefined || key === "path" || key === "nwst") continue;
       if (Array.isArray(val)) {
         for (const v of val) params.append(key, String(v));
       } else {
         params.set(key, String(val));
       }
     }
-    params.set("path", "/novnc/websockify");
+    params.set("path", `/novnc/websockify?t=${encodeURIComponent(ticket)}`);
+    params.set("nwst", "1");
     if (!params.has("autoconnect")) params.set("autoconnect", "1");
+    if (!params.has("resize")) params.set("resize", "scale");
     return res.redirect(302, `/novnc/vnc.html?${params.toString()}`);
   }
   req.url = req.url.replace(/^\/novnc/, "") || "/";
@@ -2092,12 +2157,12 @@ server.on("upgrade", async (req, socket, head) => {
       socket.destroy();
       return;
     }
-    if (!verifyTuiAuth(req)) {
+    if (!verifyNovncWsUpgrade(req, req.url)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"OpenClaw noVNC\"\r\n\r\n");
       socket.destroy();
       return;
     }
-    req.url = req.url.replace(/^\/novnc/, "") || "/";
+    req.url = stripTrailingTicketQuery(req.url.replace(/^\/novnc/, "") || "/");
     novncProxy.ws(req, socket, head, { target: NOVNC_TARGET });
     return;
   }
